@@ -1,70 +1,16 @@
 module Main where
 
 import Data.Char
+import Control.Applicative
+import Control.Monad hiding (function)
+import Control.Monad.Fail
 
-data Token
-    = TokInt Int
-    | TokPlus
-    | TokMinus
-    | TokTimes
-    | TokDivide
-    | TokLParen
-    | TokRParen
-    deriving (Show, Eq)
-
-
-lexToken :: String -> (Token, String) 
-lexToken s = case s of
-    '+':ss          -> (TokPlus, ss)
-    '-':ss          -> (TokMinus, ss)
-    '*':ss          -> (TokTimes, ss)
-    '/':ss          -> (TokDivide, ss)
-    '(':ss          -> (TokLParen, ss)
-    ')':ss          -> (TokRParen, ss)
-    c:_ | isDigit c -> (TokInt (read $ takeWhile isDigit s), dropWhile isDigit s)
-    ' ':ss          -> lexToken ss
-    _               -> error ("lex error at: " ++ s)
-
-
-lexTokens :: String -> [Token]
-lexTokens s = case lexToken s of
-    (tok, "") -> [tok]
-    (tok, s)  -> (tok:lexTokens s)
-
-
-data Expr
-    = ExprPlus   Expr Expr
-    | ExprTerm   Expr
-    | TermTimes  Expr Expr
-    | TermFactor Expr
-    | FactParen  Expr
-    | FactConst  Int
-    deriving (Show, Eq)
-
-data Const
-    = ConstInt Int
-    deriving (Show, Eq)
-
-
-
-newtype Parser a 
-    = Parser { getParser :: ([Token] -> [(a, [Token])]) }
-
-instance Functor Parser where
-    fmap f (Parser p) = Parser $ \toks -> map (\(r, ts) -> (f r, ts)) (p toks)
-
-instance Applicative Parser where
-    pure x                    = Parser $ \toks -> [(x, toks)]
-    (Parser f) <*> (Parser x) = Parser $ \toks -> concat $ map (\(rx, ts) -> map (\(rf, ts') -> (rf rx, ts')) (f ts) ) (x toks)
-
-instance Monad Parser where
-    return           = pure
-    (Parser a) >>= f = Parser $ \toks -> concat $ map (\(r, ts) -> let (Parser b) = f r in b ts) (a toks)
-
-
-instance MonadFail Parser where
-    fail = error
-
+import LLVM.AST hiding (function)
+import LLVM.AST.Type hiding (void)
+import LLVM.IRBuilder.Instruction       
+import LLVM.IRBuilder.Module
+import LLVM.IRBuilder.Monad
+import LLVM.IRBuilder.Constant
 
 -- <expr>  ::= <term> "+" <expr>
 --          |  <term>
@@ -76,6 +22,72 @@ instance MonadFail Parser where
 --           |  <const>
 --
 -- <const> ::= integer
+
+data Operator
+    = Plus
+    | Minus
+    | Times
+    | Divide
+    deriving (Show, Eq)
+
+
+data Token
+    = TokInt Int
+    | TokOp  Operator
+    | TokLParen
+    | TokRParen
+    deriving (Show, Eq)
+
+
+data Expr
+    = Expr Expr Operator Expr
+    | Term Expr Operator Expr
+    | Fact Int
+    deriving (Show, Eq)
+
+
+newtype Parser a 
+    = Parser { getParser :: ([Token] -> [(a, [Token])]) }
+
+instance Functor Parser where
+    fmap f p = Parser $ \toks -> [ (f x, toks') | (x, toks') <- (getParser p) toks ]
+
+instance Applicative Parser where
+    pure x    = Parser $ \toks -> [(x, toks)]
+    pf <*> px = Parser $ \toks ->
+        concat [ (getParser $ fmap f px) toks' | (f, toks') <- (getParser pf) toks ]
+ 
+instance Monad Parser where
+    return  = pure
+    p >>= f = Parser $ \toks ->
+        concat [ (getParser $ f x) toks' | (x, toks') <- (getParser p) toks ]
+
+instance Alternative Parser where
+    empty     = Parser $ \toks -> []
+    pa <|> pb = Parser $ \toks -> (getParser pa) toks ++ (getParser pb) toks
+    
+
+instance MonadFail Parser where
+    fail = error
+
+
+lexToken :: String -> (Token, String) 
+lexToken s = case s of
+    '+':ss          -> (TokOp Plus, ss)
+    '-':ss          -> (TokOp Minus, ss)
+    '*':ss          -> (TokOp Times, ss)
+    '/':ss          -> (TokOp Divide, ss)
+    '(':ss          -> (TokLParen, ss)
+    ')':ss          -> (TokRParen, ss)
+    c:_ | isDigit c -> (TokInt (read $ takeWhile isDigit s), dropWhile isDigit s)
+    ' ':ss          -> lexToken ss
+    _               -> error ("lex error at: " ++ s)
+
+
+lexTokens :: String -> [Token]
+lexTokens s = case lexToken s of
+    (tok, "") -> [tok]
+    (tok, s)  -> (tok:lexTokens s)
 
 
 parseToken :: Token -> Parser Token
@@ -90,41 +102,56 @@ parseInt = Parser $ \toks -> case toks of
     _             -> []
 
 
-choice :: Parser a -> Parser a -> Parser a
-choice (Parser a) (Parser b) = Parser (\toks -> a toks ++ b toks)
-
-
 parseFactor :: Parser Expr
-parseFactor = choice (fmap FactConst parseInt) $ do
+parseFactor = fmap Fact parseInt <|> do
     parseToken TokLParen
-    n <- parseInt
+    expr <- parseExpr
     parseToken TokRParen
-    return $ FactParen (FactConst n) 
+    return expr
 
 
 parseTerm :: Parser Expr
-parseTerm = choice (fmap TermFactor parseFactor) $ do
+parseTerm = parseFactor <|> do
     fact <- parseFactor
-    parseToken TokTimes
+    TokOp op <- parseToken (TokOp Times) <|> parseToken (TokOp Divide)
     term <- parseTerm
-    return (TermTimes fact term)
+    return (Term fact op term)
 
 
 parseExpr :: Parser Expr
-parseExpr = choice (fmap ExprTerm parseTerm) $ do
+parseExpr = parseTerm <|> do
     term <- parseTerm
-    parseToken TokPlus
+    TokOp op <- parseToken (TokOp Plus) <|> parseToken (TokOp Minus)
     expr <- parseExpr
-    return (ExprPlus term expr)
+    return (Expr term op expr)
 
 
 parse :: [Token] -> Expr
-parse toks = case filter (null . snd) ((getParser parseExpr) toks) of
+parse toks = case filter (null . snd) (getParser parseExpr $ toks) of
     []        -> error "can't parse"
     [(e, [])] -> e
     _         -> error "more than one parse"
 
+
+compile :: Expr -> ModuleBuilder ()
+compile expr =
+    void $ function (mkName "main") [] i64 $ \_ ->
+        ret =<< compileExpr expr
+
+
+compileExpr :: Monad m => Expr -> IRBuilderT m Operand
+compileExpr e = case e of
+    Expr term Plus expr   -> join $ liftM2 add (compileExpr term) (compileExpr expr)
+    Expr term Minus expr  -> join $ liftM2 sub (compileExpr term) (compileExpr expr)
+    Term fact Times term  -> join $ liftM2 mul (compileExpr fact) (compileExpr term)
+    Term fact Divide term -> join $ liftM2 sdiv (compileExpr fact) (compileExpr term)
+    Fact n                -> return $ int64 (fromIntegral n)
+
+
 main :: IO ()
 main = do
     line <- getLine
-    putStrLn $ show $ parse (lexTokens line)
+    let expr = parse (lexTokens line)
+    let defs = execModuleBuilder emptyModuleBuilder (compile expr)
+    putStrLn (show defs)
+
