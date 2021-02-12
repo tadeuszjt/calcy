@@ -1,3 +1,4 @@
+{-# LANGUAGE OverloadedStrings #-}
 module Main where
 
 import Data.Char
@@ -11,6 +12,23 @@ import LLVM.IRBuilder.Instruction
 import LLVM.IRBuilder.Module
 import LLVM.IRBuilder.Monad
 import LLVM.IRBuilder.Constant
+
+import qualified LLVM.CodeGenOpt          as CodeGenOpt
+import qualified LLVM.CodeModel           as CodeModel
+import qualified LLVM.Relocation          as Reloc
+import           Data.IORef
+import           Foreign.Ptr
+import           LLVM.Target
+import           LLVM.Context
+import qualified LLVM.Module              as M
+import           LLVM.OrcJIT
+import           LLVM.OrcJIT.CompileLayer
+import           LLVM.Internal.ObjectFile
+
+foreign import ccall "dynamic" mkFun :: FunPtr (IO Int) -> (IO Int)
+
+run :: FunPtr a -> IO Int
+run fn = mkFun (castFunPtr fn :: FunPtr (IO Int))
 
 -- <expr>  ::= <term> "+" <expr>
 --          |  <term>
@@ -36,6 +54,7 @@ data Token
     | TokOp  Operator
     | TokLParen
     | TokRParen
+    | TokEnd
     deriving (Show, Eq)
 
 
@@ -80,6 +99,7 @@ lexToken s = case s of
     '(':ss          -> (TokLParen, ss)
     ')':ss          -> (TokRParen, ss)
     c:_ | isDigit c -> (TokInt (read $ takeWhile isDigit s), dropWhile isDigit s)
+    ""              -> (TokEnd, "")
     ' ':ss          -> lexToken ss
     _               -> error ("lex error at: " ++ s)
 
@@ -148,10 +168,47 @@ compileExpr e = case e of
     Fact n                -> return $ int64 (fromIntegral n)
 
 
+
+
+withSession :: (Context -> ExecutionSession -> IRCompileLayer ObjectLinkingLayer -> IO ()) -> IO ()
+withSession f = do
+    resolvers <- newIORef []
+    withContext $ \ctx -> 
+        withExecutionSession $ \es ->
+            withHostTargetMachine Reloc.PIC CodeModel.Default CodeGenOpt.None $ \tm -> do
+                withObjectLinkingLayer es (\_ -> fmap head $ readIORef resolvers) $ \oll ->
+                    withIRCompileLayer oll tm $ \cl ->
+                        withSymbolResolver es (myResolver cl) $ \psr -> do
+                            writeIORef resolvers [psr]
+                            f ctx es cl
+                                
+    where
+        myResolver :: IRCompileLayer ObjectLinkingLayer -> SymbolResolver
+        myResolver cl = SymbolResolver $ \mangled -> do
+            symbol <- findSymbol cl mangled False
+            case symbol of
+                Right _ -> return symbol
+                Left _  -> error ("symbol resolver error: " ++ show symbol)
+
+
+jitAndRunMain :: [Definition] -> ExecutionSession -> Context -> IRCompileLayer ObjectLinkingLayer -> IO ()
+jitAndRunMain defs es ctx cl = do
+    let astmod = defaultModule { moduleDefinitions = defs }
+    withModuleKey es $ \modKey ->
+        M.withModuleFromAST ctx astmod $ \mod -> do
+            addModule cl modKey mod
+            mangled <- mangleSymbol cl "main"
+            Right (JITSymbol fn _) <- findSymbolIn cl modKey mangled False
+            run $ castPtrToFunPtr (wordPtrToPtr fn)
+            removeModule cl modKey
+
+
 main :: IO ()
-main = do
-    line <- getLine
-    let expr = parse (lexTokens line)
-    let defs = execModuleBuilder emptyModuleBuilder (compile expr)
-    putStrLn (show defs)
+main =
+    withSession $ \ctx es cl -> do
+        line <- getLine
+        let expr = parse (lexTokens line)
+        let defs = execModuleBuilder emptyModuleBuilder (compile expr)
+        putStrLn (show defs)
+
 
